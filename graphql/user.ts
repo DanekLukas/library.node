@@ -6,6 +6,7 @@ import { userAttributes, user as userInit } from '../models/user'
 import { user_group as user_groupInit } from '../models/user_group'
 import { view_group as view_groupInit } from '../models/view_group'
 
+import { where } from 'sequelize'
 import crypto from 'crypto'
 import nodemailer from 'nodemailer'
 
@@ -15,6 +16,14 @@ const getHash = (password: string) =>
   crypto.pbkdf2Sync(password, process.env.SALT!, 1000, 64, `sha512`).toString(`hex`)
 
 export const userGraphql = (dbTable: UZIVATEL): GraphQLSchemaModule => {
+  const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST,
+    port: process.env.EMAIL_PORT,
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASSWORD,
+    },
+  })
   const salt = process.env.SALT!
   return {
     typeDefs: gql`
@@ -61,7 +70,8 @@ export const userGraphql = (dbTable: UZIVATEL): GraphQLSchemaModule => {
         ): Int!
         deleteUser(where: whereId): Boolean!
         Register(email: String, lang: String, id_group: Int): retval
-        SetPassword(password: String, newPassword: String): loginretval
+        SetPassword(id: Int, password: String, newPassword: String): loginretval
+        ResetPassword(email: String, lang: String): retval
       }
       type user {
         first_name: String
@@ -170,22 +180,65 @@ export const userGraphql = (dbTable: UZIVATEL): GraphQLSchemaModule => {
               return true
             }),
         SetPassword: async (obj: any, args: any, context: any, info: any) => {
-          if (
-            (
-              await dbTable.update(
-                { password: getHash(args.newPassword) },
-                { where: { password: getHash(args.password), id: context.session.user.id } }
-              )
-            )[0] === 1
-          )
+          try {
+            if (!context.session?.user?.id) {
+              const hash = getHash(args.password)
+              const view_group = await view_groupInit.findOne({
+                attributes: [
+                  'id_user',
+                  'email',
+                  'id_user_type',
+                  'user_type_name',
+                  'id_group_actual',
+                ],
+                where: { id_user: args.id, password: hash },
+              })
+              if (!view_group) {
+                return {
+                  errro: 'wrong password',
+                  data: {},
+                  message: 'not logged',
+                }
+              }
+              context.session.user = {
+                id: view_group.getDataValue('id_user'),
+                email: view_group.getDataValue('email'),
+                role: view_group.getDataValue('id_user_type'),
+                actual: view_group.getDataValue('id_group_actual'),
+              }
+            }
+            if (
+              context.session.user.id &&
+              (
+                await dbTable.update(
+                  { password: getHash(args.newPassword) },
+                  { where: { password: getHash(args.password), id: context.session.user.id } }
+                )
+              )[0] === 1
+            )
+              return {
+                error: '',
+                data: {
+                  id: context.session.user.id,
+                  email: context.session.user.email,
+                  roles: context.session.user.role,
+                },
+                message: 'Logged in',
+              }
             return {
               errro: '',
-              data: { id: context.session.user.id, email: context.session.user.email },
-              message: 'password updated',
+              data: { id: args.id, email: '' },
+              message: 'password not updated',
             }
-          else
-            return { errro: '', data: { id: args.id, email: '' }, message: 'password not updated' }
+          } catch (error) {
+            return {
+              error: (error as any).message,
+              data: { id: '', email: '', roles: [] },
+              message: '',
+            }
+          }
         },
+
         Register: async (obj: any, args: any, context: any, info: any) => {
           try {
             let userId = 0
@@ -243,21 +296,60 @@ export const userGraphql = (dbTable: UZIVATEL): GraphQLSchemaModule => {
 
             if (args.id_group && password === '')
               return { error: '', data: '', message: 'Uživatel byl přidán do skupiny.' }
-
-            const transporter = nodemailer.createTransport({
-              host: process.env.EMAIL_HOST,
-              port: process.env.EMAIL_PORT,
-              auth: {
-                user: process.env.EMAIL_USER,
-                pass: process.env.EMAIL_PASSWORD,
-              },
-            })
-
             const mailOptions = {
               from: 'Knihovna <lukas@danek-family.cz>',
               to: args.email,
               subject: 'Registrace do aplikace Knihovna',
-              html: `<h3>Registrace do aplikace Knihovna</h3><p>Registrace do aplikace knihovna.</p><p>Nyní je pro tento email password "${password}"</p>`,
+              html: `<h3>Registrace do aplikace Knihovna</h3><p>Registraci do aplikace Knihovna dokončíte nastavením <a href=${`https://${
+                process.env.ADDRESS_HOST
+              }/set-password?token=${Buffer.from(`${userId}-${password}`).toString(
+                'base64'
+              )}`}>nového hesla</a>.</p>`,
+            }
+
+            transporter.sendMail(mailOptions, (error, info) => {
+              return { error: error || '', data: '', message: info.response || '' }
+            })
+            return { error: '', data: '', message: 'Mail sent' }
+          } catch (error) {
+            return { error: (error as any).message || '', data: '', message: '' }
+          }
+        },
+
+        ResetPassword: async (obj: any, args: any, context: any, info: any) => {
+          try {
+            let userId = 0
+            const groupId = args.id_group || 0
+            let password = ''
+            if (args.email)
+              userId =
+                (
+                  await userInit.findOne({ attributes: ['id'], where: { email: args.email } })
+                )?.getDataValue('id') || 0
+            if (!userId) {
+              return {
+                error: 'Uživatel neexistuje',
+                data: '',
+                message: 'Uživatel neexistuje',
+              }
+            }
+            password = crypto
+              .pbkdf2Sync(crypto.randomBytes(16), salt, 1000, 64, `sha512`)
+              .toString('hex')
+              .substring(0, 10)
+            const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, `sha512`).toString(`hex`)
+
+            await userInit.update({ password: hash }, { where: { id: userId } })
+
+            const mailOptions = {
+              from: 'Knihovna <lukas@danek-family.cz>',
+              to: args.email,
+              subject: 'Reset hesla aplikace Knihovna',
+              html: `<h3>Reset hesla aplikace Knihovna</h3><p><a href=${`https://${
+                process.env.ADDRESS_HOST
+              }/set-password?token=${Buffer.from(`${userId}-${password}`).toString(
+                'base64'
+              )}`}>Nastavte si nové heslo.</a></p>`,
             }
 
             transporter.sendMail(mailOptions, (error, info) => {
